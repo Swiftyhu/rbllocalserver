@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Local DNS IP classifier. Python >= 3.9, dnspython >= 2.4."""
+import argparse
+import ipaddress
+from collections import OrderedDict
+from concurrent.futures import Future
+import logging
+import os
+import re
+import signal
+import socket
+import socketserver
+import struct
+import threading
+import time
+
+import dns.exception
+import dns.flags
+import dns.message
+import dns.name
+import dns.opcode
+import dns.rcode
+import dns.rdataclass
+import dns.rdatatype
+import dns.resolver
+import dns.reversename
+import dns.rrset
+
+# Name of the host where this RBL reachable.
+RBL_HOSTNAME = ''
+RBL_BINDIP = '127.0.0.1'
+RBL_BINDPORT = 1053
+# IP oft the host where this RBL reachable.
+RBL_HOSTIP = ''
+# Name of the NS of this RBL.
+RBL_NS = ''
+REGEX_FILE = '/etc/postfix/access/rbllocalserver.regex'
+RESP_DUNNO = '127.0.0.1'
+RESP_BLACKLIST = '127.0.0.127'
+RESP_WHITELIST = '127.0.0.255'
+RESP_TTL = 900
+CACHE_TIMEOUT = 600
+CACHE_MAX_ENTRIES = 10000
+DNS_LOOKUP_TIMEOUT = 10
+UDP_MAX_PAYLOAD = 1232
+TCP_IDLE_TIMEOUT = 15
+MAX_CLIENTS = 32
+SOA_TTL = 300
+SOA_MINIMUM = 60
+LOG_FILE = '/tmp/rbl.log'
+ERR_FILE = '/tmp/rbl.err'
+ZONE = RBL_HOSTNAME.rstrip('.').lower() + '.'
+ZONE_DNS = dns.name.from_text(ZONE)
+HOST_REGEX = re.compile(
+    r'(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){4}'
+    + re.escape(ZONE), re.IGNORECASE)
+LOG = logging.getLogger('rbl')
+
+
+class LookupCache:
+    """Bounded LRU; concurrent identical lookups share one Future.
+
+    Cache TTLs use upstream positive TTL or RFC 2308 negative SOA TTL.
+    Lookup failures are shared with current waiters but are not cached.
+    """
+    def __init__(self, max_entries=CACHE_MAX_ENTRIES, clock=time.monotonic):
+        self.max_entries = max_entries
+        self.clock = clock
+        self.entries = OrderedDict()
+        self.pending = {}
+        self.lock = threading.Lock()
+
+    def lookup(self, key, loader):
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is not None:
+                expires, value = entry
+                if expires > self.clock():
+                    self.entries.move_to_end(key)
+                    return value
+                del self.entries[key]
+            future = self.pending.get(key)
+            owner = future is None
+            if owner:
+                future = self.pending[key] = Future()
+        if not owner:
+            return future.result()
+        try:
+            value, ttl = loader()
+            with self.lock:
+                if ttl > 0 and self.max_entries > 0:
+                    self.entries[key] = (self.clock() + min(ttl, CACHE_TIMEOUT), value)
+                    self.entries.move_to_end(key)
+                    while len(self.entries) > self.max_entries:
+                        self.entries.popitem(last=False)
+            future.set_result(value)
+            return value
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            with self.lock:
+                self.pending.pop(key, None)
+
+
+def negative_ttl(response, qname):
+    """No suitable SOA means no negative caching."""
+    candidates = []
+    for rrset in response.authority:
+        if (rrset.rdtype == dns.rdatatype.SOA
+                and rrset.rdclass == dns.rdataclass.IN
+                and qname.is_subdomain(rrset.name)):
+            candidates.append((len(rrset.name.labels), min(rrset.ttl, rrset[0].minimum)))
+    return max(candidates)[1] if candidates else 0
+
+
+class DNSLookup:
+    def __init__(self, cache=None):
+        self.cache = cache if cache is not None else LookupCache()
+        self.local = threading.local()
+
+    def resolver(self):
+        if not hasattr(self.local, 'resolver'):
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = DNS_LOOKUP_TIMEOUT
+            resolver.lifetime = DNS_LOOKUP_TIMEOUT
+            self.local.resolver = resolver
+        return self.local.resolver
+
+    def resolve(self, name, rdtype):
+        qname = (name if isinstance(name, dns.name.Name)
+                 else dns.name.from_text(name)).canonicalize()
+        key = (qname, rdtype)
+
+        def load():
+            try:
+                result = self.resolver().resolve(
+                    qname, rdtype, search=False, raise_on_no_answer=False)
+            except dns.resolver.NXDOMAIN as exc:
+                responses = exc.responses()
+                # The final NXDOMAIN response may follow a CNAME chain.
+                response = list(responses.values())[-1]
+                terminal = response.resolve_chaining().canonical_name
+                return (), negative_ttl(response, terminal)
+            if result.rrset is None:
+                return (), negative_ttl(result.response, result.canonical_name)
+            if rdtype == dns.rdatatype.PTR:
+                values = tuple(dict.fromkeys(
+                    record.target.to_text().rstrip('.').lower() for record in result))
+            else:
+                values = tuple(record.address for record in result)
+            # Include CNAME TTLs, not just the terminal RRset TTL.
+            ttl = result.response.resolve_chaining().minimum_ttl
+            return values, ttl
+
+        return self.cache.lookup(key, load)
+
+    def ptr(self, ip):
+        return self.resolve(dns.reversename.from_address(ip), dns.rdatatype.PTR)
+
+    def addresses(self, name):
+        return self.resolve(name.rstrip('.') + '.', dns.rdatatype.A)
+
+
+class Rules:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.pattern = self.read()
+        self.serial = int(time.time()) & 0xffffffff
+
+    def read(self):
+        with open(self.path, encoding='utf-8') as stream:
+            patterns = [line.strip() for line in stream
+                        if line.strip() and not line.lstrip().startswith('#')]
+        if not patterns:
+            raise ValueError('Empty regex rules: ' + self.path)
+        return re.compile('|'.join('(?:' + item + ')' for item in patterns), re.IGNORECASE)
+
+    def reload(self):
+        try:
+            pattern = self.read()
+        except Exception:
+            LOG.exception('Rule reload rejected; previous rules retained')
+            return False
+        with self.lock:
+            self.pattern = pattern
+            self.serial = (self.serial + 1) & 0xffffffff
+        LOG.info('Rules reloaded: %s', self.path)
+        return True
+
+    def snapshot(self):
+        with self.lock:
+            return self.pattern, self.serial
+
+
+class Application:
+    def __init__(self, rules, lookup=None):
+        self.rules = rules
+        self.lookup = lookup if lookup is not None else DNSLookup()
+
+    def classify(self, ip, pattern):
+        # Private, loopback, link-local, shared, reserved and multicast
+        # addresses must not trigger PTR/A lookups.
+        address = ipaddress.IPv4Address(ip)
+        if not address.is_global or address.is_multicast:
+            return RESP_DUNNO
+        names = self.lookup.ptr(ip)
+        if not names:
+            return RESP_BLACKLIST
+        matching = [name for name in names if pattern.match(name)]
+        if not matching:
+            return RESP_DUNNO
+        error = None
+        for name in matching:
+            try:
+                if ip in self.lookup.addresses(name):
+                    return RESP_WHITELIST
+            except (dns.exception.Timeout, dns.resolver.NoNameservers) as exc:
+                error = exc
+        if error is not None:
+            raise error
+        return RESP_BLACKLIST
+
+    def soa(self, serial):
+        return dns.rrset.from_text(
+            ZONE, min(SOA_TTL, SOA_MINIMUM), 'IN', 'SOA',
+            f'{RBL_NS.rstrip(".")}. hostmaster.{ZONE} '
+            f'{serial} 3600 600 86400 {SOA_MINIMUM}')
+
+    def reply(self, request):
+        response = dns.message.make_response(request)
+        response.flags &= ~dns.flags.RA
+        if request.edns >= 0:
+            response.use_edns(edns=0, payload=UDP_MAX_PAYLOAD)
+            if request.edns != 0:
+                response.set_rcode(dns.rcode.BADVERS)
+                return response
+        if request.opcode() != dns.opcode.QUERY:
+            response.set_rcode(dns.rcode.NOTIMP)
+            return response
+        if len(request.question) != 1:
+            response.set_rcode(dns.rcode.FORMERR)
+            return response
+        question = request.question[0]
+        if question.rdclass != dns.rdataclass.IN:
+            response.set_rcode(dns.rcode.REFUSED)
+            return response
+        qname = question.name.to_text().lower()
+        if not question.name.is_subdomain(ZONE_DNS):
+            response.set_rcode(dns.rcode.REFUSED)
+            return response
+        if question.rdtype in (dns.rdatatype.AXFR, dns.rdatatype.IXFR):
+            response.set_rcode(dns.rcode.REFUSED)
+            return response
+        response.flags |= dns.flags.AA
+        pattern, serial = self.rules.snapshot()
+        value = None
+        if qname == ZONE:
+            if question.rdtype == dns.rdatatype.A:
+                value = RBL_HOSTIP
+            elif question.rdtype == dns.rdatatype.NS:
+                value = RBL_NS.rstrip('.') + '.'
+            elif question.rdtype == dns.rdatatype.SOA:
+                rrset = self.soa(serial)
+                rrset.ttl = SOA_TTL
+                response.answer.append(rrset)
+        elif HOST_REGEX.fullmatch(qname):
+            if question.rdtype == dns.rdatatype.A:
+                ip = '.'.join(reversed(qname.split('.')[:4]))
+                value = self.classify(ip, pattern)
+        else:
+            response.set_rcode(dns.rcode.NXDOMAIN)
+        if value is not None:
+            response.answer.append(dns.rrset.from_text(
+                question.name, RESP_TTL, 'IN', question.rdtype, value))
+        if not response.answer:
+            response.authority.append(self.soa(serial))
+        return response
+
+    def handle(self, wire, peer, tcp=False):
+        try:
+            request = dns.message.from_wire(wire)
+        except Exception:
+            LOG.warning('Malformed DNS packet: peer=%s', peer)
+            return None
+        if request.flags & dns.flags.QR:
+            return None
+        try:
+            response = self.reply(request)
+        except Exception:
+            LOG.exception('Request failed: peer=%s', peer)
+            response = dns.message.make_response(request)
+            response.flags &= ~dns.flags.RA
+            response.set_rcode(dns.rcode.SERVFAIL)
+        addresses = [record.address for rrset in response.answer
+                     if rrset.rdtype == dns.rdatatype.A for record in rrset]
+        classifications = {
+            RESP_BLACKLIST: 'BLACK',
+            RESP_WHITELIST: 'WHITE',
+            RESP_DUNNO: 'DUNNO',
+        }
+        is_ip_query = (len(request.question) == 1
+                       and HOST_REGEX.fullmatch(
+                           request.question[0].name.to_text().lower())
+                       and request.question[0].rdtype == dns.rdatatype.A)
+        result = (classifications.get(addresses[0], 'ANSWER')
+                  if is_ip_query and addresses else
+                  'ANSWER' if response.answer else
+                  'NODATA' if response.rcode() == dns.rcode.NOERROR else
+                  dns.rcode.to_text(response.rcode()))
+        quiet_types = {
+            dns.rdatatype.AAAA,
+            dns.rdatatype.HTTPS,
+            dns.rdatatype.MX,
+        }
+        if not (len(request.question) == 1
+                and request.question[0].rdtype in quiet_types):
+            LOG.info('peer=%s transport=%s question=%s rcode=%s result=%s A=%s',
+                     peer, 'TCP' if tcp else 'UDP', request.question,
+                     dns.rcode.to_text(response.rcode()), result,
+                     ','.join(addresses) if addresses else '-')
+        limit = 65535 if tcp else (
+            min(max(512, request.payload), UDP_MAX_PAYLOAD)
+            if request.edns >= 0 else 512)
+        return response.to_wire(max_size=limit, prefer_truncation=not tcp)
+
+
+class BoundedThreads(socketserver.ThreadingMixIn):
+    daemon_threads = True
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+class UDPServer(BoundedThreads, socketserver.UDPServer):
+    max_packet_size = 65535
+
+
+class TCPServer(BoundedThreads, socketserver.TCPServer):
+    allow_reuse_address = True
+    request_queue_size = MAX_CLIENTS
+
+
+class UDPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        wire, sock = self.request
+        try:
+            reply = self.server.app.handle(wire, self.client_address)
+            if reply is not None:
+                sock.sendto(reply, self.client_address)
+        except Exception:
+            LOG.exception('UDP request failed: peer=%s', self.client_address)
+
+
+def recv_exact(sock, count):
+    parts = bytearray()
+    while len(parts) < count:
+        block = sock.recv(count - len(parts))
+        if not block:
+            if not parts:
+                return None
+            raise EOFError('Incomplete TCP frame')
+        parts.extend(block)
+    return bytes(parts)
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(TCP_IDLE_TIMEOUT)
+        try:
+            while True:
+                prefix = recv_exact(self.request, 2)
+                if prefix is None:
+                    return
+                size = struct.unpack('!H', prefix)[0]
+                if size == 0:
+                    return
+                wire = recv_exact(self.request, size)
+                if wire is None:
+                    return
+                reply = self.server.app.handle(wire, self.client_address, tcp=True)
+                if reply is not None:
+                    self.request.sendall(struct.pack('!H', len(reply)) + reply)
+        except (OSError, EOFError):
+            return
+        except Exception:
+            LOG.exception('TCP request failed: peer=%s', self.client_address)
+
+
+def configure_logging():
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    for path, level in ((LOG_FILE, logging.INFO), (ERR_FILE, logging.ERROR)):
+        handler = logging.FileHandler(path, encoding='utf-8')
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        LOG.addHandler(handler)
+
+
+def daemonize():
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    os.chdir('/')
+    os.umask(0o077)
+    fd = os.open('/dev/null', os.O_RDWR)
+    try:
+        for target in (0, 1, 2):
+            os.dup2(fd, target)
+    finally:
+        if fd > 2:
+            os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--foreground', action='store_true')
+    parser.add_argument('--regex-file', default=REGEX_FILE)
+    parser.add_argument('--bind', default=RBL_BINDIP)
+    parser.add_argument('--port', default=RBL_BINDPORT, type=int)
+    args = parser.parse_args()
+    rules = Rules(os.path.abspath(args.regex_file))
+    app = Application(rules)
+    # Check both binds before the parent process exits.
+    with UDPServer((args.bind, args.port), UDPHandler) as udp:
+        with TCPServer((args.bind, args.port), TCPHandler) as tcp:
+            if not args.foreground:
+                daemonize()
+            configure_logging()
+            # Bound both protocols together; reserve independent slots so
+            # idle TCP connections cannot exhaust UDP capacity.
+            for server in (udp, tcp):
+                server.app = app
+                server.slots = threading.BoundedSemaphore(MAX_CLIENTS)
+            reload_event = threading.Event()
+            stop_event = threading.Event()
+            signal.signal(signal.SIGHUP, lambda *_: reload_event.set())
+            signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+            signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+            threads = [threading.Thread(target=server.serve_forever, daemon=True)
+                       for server in (udp, tcp)]
+            for thread in threads:
+                thread.start()
+            LOG.info('RBL started: PID=%s UDP/TCP=%s:%s', os.getpid(), args.bind, args.port)
+            try:
+                while not stop_event.wait(0.2):
+                    if reload_event.is_set():
+                        reload_event.clear()
+                        rules.reload()
+            finally:
+                for server in (udp, tcp):
+                    server.shutdown()
+                for thread in threads:
+                    thread.join()
+                LOG.info('RBL stopped')
+
+
+if __name__ == '__main__':
+    main()
